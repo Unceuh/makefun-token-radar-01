@@ -2,7 +2,8 @@
 //
 // What this program does, end to end:
 //   1. find the snapshot (--input, a file or a directory holding snapshot.json),
-//   2. rank every pre-token protocol with the model in lib/model.ts,
+//   2. fit the value model from the snapshot itself (log market cap on log TVL, with the
+//      shrunk category effects) and price every pre-token protocol the house rule keeps,
 //   3. refuse to continue when the board fails the gate in boardIssue,
 //   4. write board.json and data.js, copy dashboard/ and screenshots/ across,
 //   5. finish with dossier.json, the summary the judge reads, built from the
@@ -82,9 +83,7 @@ function run(): void {
   const outDir = flagValue(process.argv, 'output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
   const snapshot = model.parseSnapshot(fs.readFileSync(snapshotPath, 'utf8'));
-  const scored = model.buildRadar(snapshot);
-  const board = scored.board;
-  const radar = scored.radar;
+  const { board, radar } = model.buildBoard(snapshot);
   const gateProblem = model.boardIssue(board, snapshot);
   if (gateProblem !== null) {
     die(1, `the board the model wrote fails the gate: ${gateProblem}`);
@@ -117,8 +116,13 @@ function run(): void {
   const boardPath = path.join(outDir, 'board.json');
   const dataPath = path.join(outDir, 'data.js');
   const dossierPath = path.join(outDir, 'dossier.json');
+  const v = radar.value;
+  const f = radar.farm.verdicts;
   process.stdout.write(
-    `radar: scored ${board.length} rows from ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} of them on the watchlist (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `radar: scored ${board.length} rows from ${snapshot.protocols.length} protocols ` +
+      `(ledger ${radar.ledger.ranked} ranked + ${radar.ledger.token_bearing} live + ${radar.ledger.excluded} excluded = ${radar.ledger.total}, checksum ${radar.ledger.checksum})\n` +
+      `radar: model radar-3 fit on ${v.train_n} comps, slope ${v.slope}, smearing ${v.smearing}, LOO RMSE ${v.loo_rmse}, walk-forward RMSE ${v.wf_rmse}\n` +
+      `radar: farm verdicts FARM ${f.farm} / MARGINAL ${f.marginal} / SKIP ${f.skip}; total implied $${radar.ledger.total_implied_usd}\n` +
       `radar: wrote ${boardPath}, ${dataPath}, ${path.join(outDir, 'dashboard')} (${dashFiles.length} files), ${path.join(outDir, 'screenshots')} (${images.length} images) and ${dossierPath}\n`,
   );
 }
