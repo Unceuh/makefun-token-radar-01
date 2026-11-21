@@ -1,4 +1,4 @@
-// Local replica of the submission gates for token-radar-01 (radar-3).
+// Local replica of the submission gates for token-radar-01 (radar-4).
 // Usage: node gate.mjs <output-dir> <snapshot.json>
 // Checks: dashboard files, board rows, sort order, coverage/ledger, farm steps,
 // screenshots, dossier match, implied bound, dossier size/text, recompute 198/198.

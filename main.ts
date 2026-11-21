@@ -121,7 +121,7 @@ function run(): void {
   process.stdout.write(
     `radar: scored ${board.length} rows from ${snapshot.protocols.length} protocols ` +
       `(ledger ${radar.ledger.ranked} ranked + ${radar.ledger.token_bearing} live + ${radar.ledger.excluded} excluded = ${radar.ledger.total}, checksum ${radar.ledger.checksum})\n` +
-      `radar: model radar-3 fit on ${v.train_n} comps, slope ${v.slope}, smearing ${v.smearing}, LOO RMSE ${v.loo_rmse}, walk-forward RMSE ${v.wf_rmse}\n` +
+      `radar: model radar-4 fit on ${v.train_n} comps, slope ${v.slope}, smearing ${v.smearing}, LOO RMSE ${v.loo_rmse}, walk-forward RMSE ${v.wf_rmse}\n` +
       `radar: farm verdicts FARM ${f.farm} / MARGINAL ${f.marginal} / SKIP ${f.skip}; total implied $${radar.ledger.total_implied_usd}\n` +
       `radar: wrote ${boardPath}, ${dataPath}, ${path.join(outDir, 'dashboard')} (${dashFiles.length} files), ${path.join(outDir, 'screenshots')} (${images.length} images) and ${dossierPath}\n`,
   );

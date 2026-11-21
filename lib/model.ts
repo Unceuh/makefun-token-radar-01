@@ -1,4 +1,4 @@
-// The token radar's model (radar-3): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-4): one snapshot of the protocol universe in, one ranked board out.
 //
 // The board ranks every pre-token protocol the house rule keeps — the watchlist is the floor,
 // never the ceiling — and accounts for all 758 protocols in a ledger: 198 ranked, 416 whose
@@ -9,13 +9,16 @@
 // The value model is FITTED from the snapshot on every run, not asserted:
 //   log(mcap) ~ intercept + slope x log(TVL) + a shrunk category effect.
 // The training set is the live-token protocols that already trade, with a market cap above zero,
-// excluding exchange tokens (an exchange's market cap is not a protocol's token value) and one
-// non-comparable comp whose token is worth more than 100x its TVL. Age, chain count and seven-day
+// excluding exchange tokens and any comp whose token is worth more than 5x its TVL: above 5x a
+// token is priced in a different regime from the one the TVL curve can price (the six comps
+// above 5x are named on the dashboard and in the methodology note, with their ratios, and the
+// model scored on all 118 comps is kept as a sensitivity). Age, chain count and seven-day
 // growth were tested as extra terms and dropped: leave-one-out says they add noise to the price,
-// not signal, so they stay out of the price. The fitted value is exp(prediction) x smearing, the
-// mean of exp(residual) over the training set; the P25–P75 band comes from the leave-one-out
-// residual quantiles, and the walk-forward split by listing date is the out-of-time check. The
-// dashboard shows all of it, including the terms that were tried and not kept.
+// not signal, so they stay out of the price and enter through the token odds instead. The fitted
+// value is exp(prediction) x smearing, the mean of exp(residual) over the training set; the
+// P25–P75 band comes from the leave-one-out residual quantiles, and the walk-forward split by
+// listing date is the out-of-time check. The dashboard shows all of it, including the terms
+// that were tried and not kept.
 //
 // The implied value is the fitted value times the token odds: a logistic P(a protocol records a
 // token) fitted on all 758 protocols, from log TVL, log age, an age-missing flag, chain count,
@@ -25,12 +28,15 @@
 // like the token-bearing set, so their odds rise; growth enters the same way, clipped, because
 // the training range is -40% to +5% and one ranked row records +4448%.
 //
-// The farm verdict is netted at the band's low end: one active wallet is assumed to capture
-// 0.001% of the launch value at the P25 end of the band, minus gas and the T-bill return on the
-// capital over the hold. FARM when that net is positive and at least $25 an hour, MARGINAL when
-// it is positive but slower, SKIP when it is not positive. The breakeven share — the share of
-// launch value a wallet must capture to break even — is shown on every row, so the verdict never
-// hides behind its assumption.
+// The farm verdict is costed on a concrete cheque, not a wallet share: one wallet deposits
+// $2,500 for 12 weeks, and the modelled drop is its pro-rata share of the launch value —
+// (deposit / TVL) x a 10% drop share to depositors x the fitted value at the P25 end of the
+// band, if the token launches. The net is that drop minus gas and the T-bill return on the
+// $2,500 over the 12 weeks. FARM when that net is positive and at least $25 an hour, MARGINAL
+// when it is positive but slower, SKIP when it is not positive. The break-even cheque — the
+// smallest deposit that covers its costs — and the drop share above which fees are covered are
+// shown on every row, so the verdict never hides behind its assumption. The odds-adjusted
+// expected take (modelled drop x token odds) is shown beside it in the detail view.
 //
 // No protocol name is ever special-cased: the same functions score every row.
 
@@ -64,6 +70,28 @@ export interface FarmStep {
   time: string;
 }
 
+/** One row of the term-selection table: a variant's out-of-sample scores, LOO and walk-forward. */
+export interface TermRow {
+  name: string;
+  loo_rmse: number;
+  loo_med_miss: number;
+  wf_rmse: number;
+  wf_med_miss: number;
+  result: string;
+}
+
+/** The cap-5 model scored on the full 118-comp set (a sensitivity, not the fit). */
+export interface Full118 {
+  n: number;
+  rmse: number;
+  mae: number;
+  r2: number;
+  med_miss: number;
+  /** The six comps above the 5x cap, scored by the cap-5 model: their own error. */
+  excluded_n: number;
+  excluded_rmse: number;
+}
+
 /** The fitted value model's numbers, as the dashboard states them. */
 export interface ValueModel {
   /** Ordinary least squares on log market cap, fit from the snapshot on every run. */
@@ -78,11 +106,21 @@ export interface ValueModel {
   /** The comp a token worth more than ratio_cap times its TVL is not: excluded by rule. */
   ratio_cap: number;
   ratio_excluded: string[];
+  /** The excluded comps, with their category and mcap/TVL ratio, for the disclosure. */
+  ratio_excluded_detail: { slug: string; category: string | null; ratio: number }[];
   kept_terms: string[];
   dropped_terms: string[];
   loo_rmse: number;
   loo_mae: number;
   loo_r2: number;
+  /** Median absolute multiple miss, leave-one-out and walk-forward: the headline error. */
+  loo_med_miss: number;
+  wf_med_miss: number;
+  /** The flat median-multiple baseline's median miss, same splits: the bar the curve must beat. */
+  flat_loo_med_miss: number;
+  flat_wf_med_miss: number;
+  /** How wide the P25–P75 band is, as a multiple (exp of the LOO interquartile range). */
+  band_width_x: number;
   /** Leave-one-out residual quantiles: the P25–P75 and P10–P90 bands. */
   loo_q10: number;
   loo_q25: number;
@@ -95,6 +133,10 @@ export interface ValueModel {
   wf_cov_p25_p75: number;
   wf_cov_p10_p90: number;
   in_sample_r2: number;
+  /** The term-selection table, computed live on the training set. */
+  terms: TermRow[];
+  /** The cap-5 model scored on all 118 comps, as a sensitivity. */
+  full118: Full118;
 }
 
 /** The token-odds logistic's fitted coefficients (fit offline, stated here). */
@@ -148,9 +190,13 @@ export const ODDS: OddsModel = {
 
 /** The farm economics' stated assumptions, as the dashboard states them. */
 export interface FarmModel {
-  /** One active wallet's share of launch value, at the band's low end. */
-  wallet_share: number;
-  /** The T-bill return on the capital over the hold, per year. */
+  /** One wallet's deposit, in dollars, for the 12-week horizon. */
+  deposit_usd: number;
+  /** The share of a launch's value that goes to depositors. */
+  drop_share: number;
+  /** The horizon, in days: 12 weeks. */
+  horizon_days: number;
+  /** The T-bill return on the deposit over the horizon, per year. */
   tbill_annual: number;
   /** The $/hour a farm must clear to be a FARM rather than MARGINAL. */
   farm_per_hour: number;
@@ -158,18 +204,29 @@ export interface FarmModel {
   gas_l2: number;
   gas_other: number;
   verdicts: { farm: number; marginal: number; skip: number };
-  median_breakeven_share: number;
+  /** The smallest deposit that covers its own costs, across the board. */
+  smallest_breakeven_deposit: number;
+  /** The median break-even deposit across the board. */
+  median_breakeven_deposit: number;
+  /** The best net per hour on the board, and the row that earns it. */
+  best_per_hour_usd: number;
+  best_per_hour_slug: string;
 }
 
 export const FARM: FarmModel = {
-  wallet_share: 0.00001,
+  deposit_usd: 2500,
+  drop_share: 0.1,
+  horizon_days: 84,
   tbill_annual: 0.045,
   farm_per_hour: 25,
   gas_ethereum: 2,
   gas_l2: 0.5,
   gas_other: 1,
-  verdicts: { farm: 83, marginal: 72, skip: 43 },
-  median_breakeven_share: 0.0000029103,
+  verdicts: { farm: 16, marginal: 78, skip: 104 },
+  smallest_breakeven_deposit: 233,
+  median_breakeven_deposit: 1655,
+  best_per_hour_usd: 32.58,
+  best_per_hour_slug: 'alphagrowth',
 };
 
 /** The chains charged the L2 gas rate: the layer-2 networks in the snapshot's chain names. */
@@ -183,7 +240,7 @@ export const L2_CHAINS: ReadonlySet<string> = new Set([
 ]);
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -257,13 +314,25 @@ export interface BoardRow {
     pred_log: number;
     p25_usd: number;
     p75_usd: number;
+    /** The fitted value if the token launches, at the P25 end of the band (no odds). */
+    fitted_p25_usd: number;
+    /** The fitted value's multiple of TVL, if the token launches. */
+    multiple: number;
   };
   farm: {
     verdict: 'FARM' | 'MARGINAL' | 'SKIP';
+    /** The modelled drop if the token launches: (deposit/TVL) x drop share x fitted P25. */
     take_usd: number;
+    /** The expected take: the modelled drop times the token odds. */
+    expected_take_usd: number;
     net_cash_usd: number;
     per_hour_usd: number;
-    breakeven_share: number;
+    /** The smallest deposit that covers its own gas and T-bill cost. */
+    breakeven_deposit_usd: number;
+    /** The drop share above which the fees are covered, at the base deposit. */
+    min_drop_share: number;
+    /** Exit if the protocol's TVL prints below this. */
+    exit_tvl_usd: number;
     gas_usd: number;
     gas_per_txn_usd: number;
     n_txn: number;
@@ -271,6 +340,9 @@ export interface BoardRow {
     hold_days: number;
     hours_total: number;
     tbill_cost_usd: number;
+    deposit_usd: number;
+    drop_share: number;
+    horizon_days: number;
   };
   farm_steps: string[];
 }
@@ -300,9 +372,14 @@ export interface RadarRow {
   watchlist_gap: boolean;
   verdict: 'FARM' | 'MARGINAL' | 'SKIP';
   take_usd: number;
+  expected_take_usd: number;
   net_cash_usd: number;
   per_hour_usd: number;
-  breakeven_share: number;
+  breakeven_deposit_usd: number;
+  min_drop_share: number;
+  exit_tvl_usd: number;
+  fitted_p25_usd: number;
+  multiple: number;
   gas_usd: number;
   gas_per_txn_usd: number;
   n_txn: number;
@@ -310,6 +387,9 @@ export interface RadarRow {
   capital_usd: number;
   hours_total: number;
   tbill_cost_usd: number;
+  deposit_usd: number;
+  drop_share: number;
+  horizon_days: number;
   farm_steps: string[];
 }
 
@@ -322,6 +402,18 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+}
+
+/** One training comp, for the scatter plot and the nearest-peers table. */
+export interface CompRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  mcap_usd: number;
+  /** The model's fitted value for this comp (in-sample): CAP ÷ model is mcap / fitted. */
+  fitted_value_usd: number;
+  ratio: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, the ledger and the fitted model. */
@@ -342,6 +434,8 @@ export interface RadarData {
   effects: CategoryEffect[];
   rows: RadarRow[];
   live: LiveRow[];
+  /** The 112 training comps, for the scatter plot and the nearest-peers table. */
+  comps: CompRow[];
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -441,27 +535,37 @@ const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 // ---------------------------------------------------------------- the fitted value model
 //
 // The training set is the snapshot's live-token protocols with a market cap above zero,
-// excluding exchange tokens and any comp whose token is worth more than 100x its TVL (the
-// ratio cap: a token worth 400x its TVL prices nothing else). The fit is ordinary least
-// squares on log market cap against log TVL, then a second stage: each category's median
-// residual, shrunk by n / (n + 5), added back as the category's effect. A category with no
-// training rows gets an effect of zero. The same fit runs on every run of the program, so
-// the numbers the dashboard shows are the numbers this snapshot produces.
+// excluding exchange tokens and any comp whose token is worth more than 5x its TVL (the
+// ratio cap: above 5x a token is priced in a different regime from the one the TVL curve
+// can price — the six comps above 5x are named with their ratios on the dashboard and in
+// the methodology note, and the model scored on all 118 comps is kept as a sensitivity).
+// The fit is ordinary least squares on log market cap against log TVL, then a second stage:
+// each category's median residual, shrunk by n / (n + 5), added back as the category's
+// effect. A category with no training rows gets an effect of zero. The same fit runs on
+// every run of the program, so the numbers the dashboard shows are the numbers this
+// snapshot produces.
 
-/** The training rows: live-token comps the log curve is fit on. */
-export function trainingSet(snapshot: Snapshot): { rows: SnapshotProtocol[]; ratioExcluded: string[] } {
+/** The training rows: live-token comps the log curve is fit on, at a ratio cap. */
+export function trainingSet(snapshot: Snapshot, cap = 5): {
+  rows: SnapshotProtocol[];
+  ratioExcluded: string[];
+  ratioDetail: { slug: string; category: string | null; ratio: number }[];
+} {
   const rows: SnapshotProtocol[] = [];
   const ratioExcluded: string[] = [];
+  const ratioDetail: { slug: string; category: string | null; ratio: number }[] = [];
   for (const p of snapshot.protocols) {
     if (isPreToken(p) || p.category === 'CEX') continue;
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    if (p.mcap_usd / p.tvl_usd > 100) {
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (ratio > cap) {
       ratioExcluded.push(p.slug);
+      ratioDetail.push({ slug: p.slug, category: p.category, ratio: Math.round(ratio * 10) / 10 });
       continue;
     }
     rows.push(p);
   }
-  return { rows, ratioExcluded };
+  return { rows, ratioExcluded, ratioDetail };
 }
 
 /** Closed-form least squares for y ~ a + b x: the slope and intercept. */
@@ -543,6 +647,152 @@ function errorStats(residuals: number[], ys: number[]): { rmse: number; mae: num
   return { rmse, mae, r2: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
 }
 
+/** Solve a small linear system by Gaussian elimination with partial pivoting. */
+function solveLinear(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M = A.map((r, i) => [...r, b[i]!]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    const tmp = M[c]!;
+    M[c] = M[piv]!;
+    M[piv] = tmp;
+    const d = M[c]![c]!;
+    if (Math.abs(d) < 1e-12) return null;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]! / d;
+      for (let k = c; k <= n; k++) M[r]![k]! -= f * M[c]![k]!;
+    }
+  }
+  return M.map((r, i) => r[n]! / M[i]![i]!);
+}
+
+/** Least squares for a design matrix with an intercept column already included. */
+function olsK(X: number[][], y: number[]): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => Array(k).fill(0));
+  const b: number[] = Array(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let a = 0; a < k; a++) {
+      b[a]! += X[i]![a]! * y[i]!;
+      for (let c = 0; c < k; c++) A[a]![c]! += X[i]![a]! * X[i]![c]!;
+    }
+  }
+  return solveLinear(A, b) ?? Array(k).fill(0);
+}
+
+/** The medians the term variants impute with, from the whole snapshot. */
+export interface VariantCtx {
+  medChg: number;
+  medAge: number;
+  asOf: string;
+}
+
+type ExtraFn = (p: SnapshotProtocol, ctx: VariantCtx) => number[];
+const EXTRA_NONE: ExtraFn = () => [];
+const EXTRA_CHG: ExtraFn = (p, ctx) => [p.change_7d ?? ctx.medChg];
+const EXTRA_AGE: ExtraFn = (p, ctx) => [Math.log((ageDays(ctx.asOf, p.listed_at) ?? ctx.medAge) + 1)];
+const EXTRA_CHAINS: ExtraFn = (p) => [p.chains.length];
+const EXTRA_LT2: ExtraFn = (p) => {
+  const lt = Math.log(p.tvl_usd);
+  return [lt * lt];
+};
+const EXTRA_ALL: ExtraFn = (p, ctx) => [
+  p.change_7d ?? ctx.medChg,
+  Math.log((ageDays(ctx.asOf, p.listed_at) ?? ctx.medAge) + 1),
+  p.chains.length,
+];
+
+/**
+ * A fit of log(mcap) on log(TVL) plus extra stage-1 terms, with the shrunk category
+ * effect as a second stage when useCat is set. Mirrors fitValue for the no-extra case.
+ */
+export interface ExtraFit {
+  beta: number[];
+  effects: Map<string, CategoryEffect>;
+  smearing: number;
+  predict: (p: SnapshotProtocol) => number;
+}
+
+export function fitValueExtra(rows: SnapshotProtocol[], extra: ExtraFn, useCat: boolean, ctx: VariantCtx): ExtraFit {
+  const X = rows.map((p) => [1, Math.log(p.tvl_usd), ...extra(p, ctx)]);
+  const y = rows.map((p) => Math.log(p.mcap_usd!));
+  const beta = olsK(X, y);
+  const raw = y.map((v, i) => v - X[i]!.reduce((s, x, j) => s + beta[j]! * x, 0));
+  const by = new Map<string, number[]>();
+  rows.forEach((p, i) => {
+    const key = p.category ?? '';
+    const list = by.get(key);
+    if (list === undefined) by.set(key, [raw[i]!]);
+    else list.push(raw[i]!);
+  });
+  const effects = new Map<string, CategoryEffect>();
+  for (const [key, rs] of by) {
+    const med = median(rs)!;
+    const n = rs.length;
+    effects.set(key, { category: key === '' ? null : key, n, median_resid: med, effect: med * (n / (n + 5)) });
+  }
+  const resid = raw.map((r, i) => r - (useCat ? (effects.get(rows[i]!.category ?? '')?.effect ?? 0) : 0));
+  const smearing = resid.reduce((s, r) => s + Math.exp(r), 0) / resid.length;
+  return {
+    beta,
+    effects,
+    smearing,
+    predict: (p) => {
+      const row = [1, Math.log(p.tvl_usd), ...extra(p, ctx)];
+      return row.reduce((s, x, j) => s + beta[j]! * x, 0) + (useCat ? (effects.get(p.category ?? '')?.effect ?? 0) : 0);
+    },
+  };
+}
+
+/** LOO + walk-forward scores for one variant: RMSE and median multiple miss on each split. */
+function variantScores(rows: SnapshotProtocol[], extra: ExtraFn, useCat: boolean, ctx: VariantCtx): {
+  loo_rmse: number;
+  loo_med_miss: number;
+  wf_rmse: number;
+  wf_med_miss: number;
+} {
+  const looResid: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rest = rows.filter((_, j) => j !== i);
+    const f = fitValueExtra(rest, extra, useCat, ctx);
+    looResid.push(Math.log(rows[i]!.mcap_usd!) - f.predict(rows[i]!));
+  }
+  const wfResid: number[] = [];
+  for (const cutoff of ['2023-01-01', '2024-01-01', '2025-01-01']) {
+    const tr = rows.filter((p) => p.listed_at !== null && p.listed_at < cutoff);
+    const te = rows.filter((p) => p.listed_at !== null && p.listed_at >= cutoff);
+    if (tr.length === 0 || te.length === 0) continue;
+    const f = fitValueExtra(tr, extra, useCat, ctx);
+    for (const p of te) wfResid.push(Math.log(p.mcap_usd!) - f.predict(p));
+  }
+  const medMiss = (rs: number[]): number => median(rs.map((r) => Math.exp(Math.abs(r)))) ?? Number.NaN;
+  const rmse = (rs: number[]): number => Math.sqrt(rs.reduce((s, r) => s + r * r, 0) / rs.length);
+  return { loo_rmse: rmse(looResid), loo_med_miss: medMiss(looResid), wf_rmse: rmse(wfResid), wf_med_miss: medMiss(wfResid) };
+}
+
+/** The flat median-multiple baseline's LOO + walk-forward median miss. */
+function flatScores(rows: SnapshotProtocol[]): { loo_med_miss: number; wf_med_miss: number; loo_rmse: number; wf_rmse: number } {
+  const looResid: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rest = rows.filter((_, j) => j !== i);
+    const mm = median(rest.map((p) => Math.log(p.mcap_usd!) - Math.log(p.tvl_usd)))!;
+    looResid.push(Math.log(rows[i]!.mcap_usd!) - (Math.log(rows[i]!.tvl_usd) + mm));
+  }
+  const wfResid: number[] = [];
+  for (const cutoff of ['2023-01-01', '2024-01-01', '2025-01-01']) {
+    const tr = rows.filter((p) => p.listed_at !== null && p.listed_at < cutoff);
+    const te = rows.filter((p) => p.listed_at !== null && p.listed_at >= cutoff);
+    if (tr.length === 0 || te.length === 0) continue;
+    const mm = median(tr.map((p) => Math.log(p.mcap_usd!) - Math.log(p.tvl_usd)))!;
+    for (const p of te) wfResid.push(Math.log(p.mcap_usd!) - (Math.log(p.tvl_usd) + mm));
+  }
+  const medMiss = (rs: number[]): number => median(rs.map((r) => Math.exp(Math.abs(r)))) ?? Number.NaN;
+  const rmse = (rs: number[]): number => Math.sqrt(rs.reduce((s, r) => s + r * r, 0) / rs.length);
+  return { loo_med_miss: medMiss(looResid), wf_med_miss: medMiss(wfResid), loo_rmse: rmse(looResid), wf_rmse: rmse(wfResid) };
+}
+
 /**
  * The leave-one-out predictions for a training set: each row predicted by a fit on all the
  * others, so the error is out-of-sample by construction. The quantiles of those residuals
@@ -602,7 +852,7 @@ export function walkForward(rows: SnapshotProtocol[], q25: number, q75: number, 
 
 /** The value model, fit from the snapshot: coefficients, smearing, LOO and walk-forward. */
 export function fitValueModel(snapshot: Snapshot): { model: ValueModel; fit: ValueFit; effects: CategoryEffect[] } {
-  const { rows, ratioExcluded } = trainingSet(snapshot);
+  const { rows, ratioExcluded, ratioDetail } = trainingSet(snapshot, 5);
   const fit = fitValue(rows);
   const { preds, ys } = looPredictions(rows);
   const looResid = ys.map((y, i) => y - preds[i]!);
@@ -615,19 +865,77 @@ export function fitValueModel(snapshot: Snapshot): { model: ValueModel; fit: Val
   const inSample = errorStats(fit.residuals, ys);
   const effects = [...fit.effects.values()].sort((a, b) =>
     (a.category ?? '') < (b.category ?? '') ? -1 : (a.category ?? '') > (b.category ?? '') ? 1 : 0);
+  const medMiss = (rs: number[]): number => median(rs.map((r) => Math.exp(Math.abs(r)))) ?? Number.NaN;
+  // Walk-forward residuals under the kept fit, for the median miss on that split.
+  const wfResid: number[] = [];
+  for (const cutoff of ['2023-01-01', '2024-01-01', '2025-01-01']) {
+    const tr = rows.filter((p) => p.listed_at !== null && p.listed_at < cutoff);
+    const te = rows.filter((p) => p.listed_at !== null && p.listed_at >= cutoff);
+    if (tr.length === 0 || te.length === 0) continue;
+    const f = fitValue(tr);
+    for (const p of te) wfResid.push(Math.log(p.mcap_usd!) - predictLog(p, f));
+  }
+  const flat = flatScores(rows);
+  // The term-selection table, computed live: each variant's LOO and walk-forward scores.
+  const ctx: VariantCtx = {
+    medChg: median(snapshot.protocols.map((p) => p.change_7d).filter((c): c is number => c !== null)) ?? -8.2334,
+    medAge: median(snapshot.protocols.map((p) => ageDays(snapshot.as_of, p.listed_at)).filter((a): a is number => a !== null)) ?? 677,
+    asOf: snapshot.as_of,
+  };
+  const sizeOnly = variantScores(rows, EXTRA_NONE, false, ctx);
+  const sizeCat = variantScores(rows, EXTRA_NONE, true, ctx);
+  const plusChg = variantScores(rows, EXTRA_CHG, true, ctx);
+  const plusAge = variantScores(rows, EXTRA_AGE, true, ctx);
+  const plusChains = variantScores(rows, EXTRA_CHAINS, true, ctx);
+  const plusLt2 = variantScores(rows, EXTRA_LT2, true, ctx);
+  const plusAll = variantScores(rows, EXTRA_ALL, true, ctx);
+  const terms: TermRow[] = [
+    { name: 'flat median multiple', loo_rmse: round4(flat.loo_rmse), loo_med_miss: round4(flat.loo_med_miss), wf_rmse: round4(flat.wf_rmse), wf_med_miss: round4(flat.wf_med_miss), result: 'baseline' },
+    { name: 'size curve only', loo_rmse: round4(sizeOnly.loo_rmse), loo_med_miss: round4(sizeOnly.loo_med_miss), wf_rmse: round4(sizeOnly.wf_rmse), wf_med_miss: round4(sizeOnly.wf_med_miss), result: 'base' },
+    { name: '+ category effect', loo_rmse: round4(sizeCat.loo_rmse), loo_med_miss: round4(sizeCat.loo_med_miss), wf_rmse: round4(sizeCat.wf_rmse), wf_med_miss: round4(sizeCat.wf_med_miss), result: 'kept' },
+    { name: '+ 7-day growth', loo_rmse: round4(plusChg.loo_rmse), loo_med_miss: round4(plusChg.loo_med_miss), wf_rmse: round4(plusChg.wf_rmse), wf_med_miss: round4(plusChg.wf_med_miss), result: 'tested, not kept' },
+    { name: '+ no-token age', loo_rmse: round4(plusAge.loo_rmse), loo_med_miss: round4(plusAge.loo_med_miss), wf_rmse: round4(plusAge.wf_rmse), wf_med_miss: round4(plusAge.wf_med_miss), result: 'tested, not kept' },
+    { name: '+ chain count', loo_rmse: round4(plusChains.loo_rmse), loo_med_miss: round4(plusChains.loo_med_miss), wf_rmse: round4(plusChains.wf_rmse), wf_med_miss: round4(plusChains.wf_med_miss), result: 'tested, not kept' },
+    { name: '+ size squared', loo_rmse: round4(plusLt2.loo_rmse), loo_med_miss: round4(plusLt2.loo_med_miss), wf_rmse: round4(plusLt2.wf_rmse), wf_med_miss: round4(plusLt2.wf_med_miss), result: 'tested, not kept' },
+    { name: '+ growth + age + chains', loo_rmse: round4(plusAll.loo_rmse), loo_med_miss: round4(plusAll.loo_med_miss), wf_rmse: round4(plusAll.wf_rmse), wf_med_miss: round4(plusAll.wf_med_miss), result: 'tested, not kept' },
+  ];
+  // Sensitivity: the cap-5 model scored on all 118 comps (the full set at the old 100x cap).
+  const fullRows = trainingSet(snapshot, 100).rows;
+  const fullResid = fullRows.map((p) => Math.log(p.mcap_usd!) - predictLog(p, fit));
+  const fullYs = fullRows.map((p) => Math.log(p.mcap_usd!));
+  const fullStats = errorStats(fullResid, fullYs);
+  // The six comps the 5x cap newly excludes: in the 118-comp set but not in the 112-comp fit
+  // (rain, at 400x, was already excluded at the old 100x cap and is not among them).
+  const cap5Slugs = new Set(rows.map((p) => p.slug));
+  const exclResid = fullRows.filter((p) => !cap5Slugs.has(p.slug)).map((p) => Math.log(p.mcap_usd!) - predictLog(p, fit));
+  const full118: Full118 = {
+    n: fullRows.length,
+    rmse: round4(fullStats.rmse),
+    mae: round4(fullStats.mae),
+    r2: round4(fullStats.r2),
+    med_miss: round4(medMiss(fullResid)),
+    excluded_n: exclResid.length,
+    excluded_rmse: round4(Math.sqrt(exclResid.reduce((s, r) => s + r * r, 0) / Math.max(1, exclResid.length))),
+  };
   const model: ValueModel = {
     intercept: fit.intercept,
     slope: fit.slope,
     smearing: fit.smearing,
     shrink_k: 5,
     train_n: rows.length,
-    ratio_cap: 100,
+    ratio_cap: 5,
     ratio_excluded: ratioExcluded,
+    ratio_excluded_detail: ratioDetail,
     kept_terms: ['category'],
     dropped_terms: ['age', 'chain_count', 'change_7d'],
     loo_rmse: round4(looStats.rmse),
     loo_mae: round4(looStats.mae),
     loo_r2: round4(looStats.r2),
+    loo_med_miss: round4(medMiss(looResid)),
+    wf_med_miss: round4(medMiss(wfResid)),
+    flat_loo_med_miss: round4(flat.loo_med_miss),
+    flat_wf_med_miss: round4(flat.wf_med_miss),
+    band_width_x: round4(Math.exp(q75 - q25)),
     loo_q10: q10,
     loo_q25: q25,
     loo_q75: q75,
@@ -639,6 +947,8 @@ export function fitValueModel(snapshot: Snapshot): { model: ValueModel; fit: Val
     wf_cov_p25_p75: wf.pooled.cov_p25_p75,
     wf_cov_p10_p90: wf.pooled.cov_p10_p90,
     in_sample_r2: round4(inSample.r2),
+    terms,
+    full118,
   };
   return { model, fit, effects };
 }
@@ -709,31 +1019,20 @@ export function tokenOdds(
 
 // ---------------------------------------------------------------- the farm plan
 //
-// Seven steps per protocol, generated from its own category, chains, TVL and age — never from
-// a list of names. The capital follows the TVL tier, the hold follows the age, the gas follows
-// the first chain. Each step states what it costs and how long it takes; the verdict is separate
-// and is computed from the band's low end (see farmEconomics), never from the step text.
+// Seven steps per protocol, generated from its own category, chains and TVL — never from
+// a list of names. Every farm uses the same concrete cheque: a $2,500 deposit held for
+// 12 weeks (84 days), $500 added each week, the gas following the first chain. Each step
+// states what it costs and how long it takes; the verdict is separate and is computed
+// from the modelled drop (see farmEconomics), never from the step text.
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
-}
-
-/** The weekly amount that follows from the capital: a fifth of it, at least $10. */
-function weeklyFor(capital: number): number {
-  return Math.max(10, Math.round(capital / 5));
-}
-
-/** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
-function holdDaysFor(age: number | null): number {
-  if (age === null) return 30;
-  if (age < 180) return 60;
-  if (age < 365) return 45;
-  return 30;
-}
+/** The farm's fixed cheque, in dollars: one wallet, one deposit, 12 weeks. */
+export const FARM_DEPOSIT = 2500;
+/** The weekly top-up that follows from the cheque: a fifth of it. */
+export const FARM_WEEKLY = 500;
+/** The second deposit in the plan: two fifths of the cheque. */
+export const FARM_SECOND = 1000;
+/** The hold, in days: 12 weeks for every protocol. */
+export const FARM_HOLD_DAYS = 84;
 
 /** The gas price of one transaction on a protocol's first chain, in dollars. */
 export function gasFor(p: SnapshotProtocol): number {
@@ -938,15 +1237,17 @@ export function stepText(step: FarmStep): string {
 
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
- * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
- * names: the category picks the template, the TVL picks the capital, the age picks the hold.
+ * from the protocol's own record (category, chains, TVL), never from a hand-written list of
+ * names: the category picks the template, and every farm uses the same $2,500 cheque held for
+ * 12 weeks, so the steps and the economics below agree on the money at stake.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+  void age;
   const chain = chainOf(p);
-  const capital = capitalFor(p);
-  const weekly = weeklyFor(capital);
-  const secondAmount = weekly * 2;
-  const hold = holdDaysFor(age);
+  const capital = FARM_DEPOSIT;
+  const weekly = FARM_WEEKLY;
+  const secondAmount = FARM_SECOND;
+  const hold = FARM_HOLD_DAYS;
   const t = templateFor(p.category);
   const gas = gasFor(p);
   return [
@@ -991,49 +1292,78 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 export interface FarmEconomics {
   verdict: 'FARM' | 'MARGINAL' | 'SKIP';
   take_usd: number;
+  expected_take_usd: number;
   net_cash_usd: number;
   per_hour_usd: number;
-  breakeven_share: number;
+  breakeven_deposit_usd: number;
+  min_drop_share: number;
+  exit_tvl_usd: number;
   gas_usd: number;
   capital_usd: number;
   hold_days: number;
   hours_total: number;
   tbill_cost_usd: number;
   n_txn: number;
+  deposit_usd: number;
+  drop_share: number;
+  horizon_days: number;
 }
 
 /**
- * The farm's economics, netted at the band's low end. One active wallet is assumed to capture
- * wallet_share of the launch value at the P25 end of the band; the net is that take minus gas
- * and the T-bill return on the capital over the hold. The breakeven share is the share of launch
- * value a wallet must capture to cover its costs — the verdict never hides behind its assumption.
+ * The farm's economics, on a concrete cheque. One wallet deposits $2,500 for 12 weeks; the
+ * modelled drop is its pro-rata share of the launch value — (deposit / TVL) x a 10% drop
+ * share to depositors x the fitted value at the P25 end of the band, if the token launches.
+ * The net is that drop minus gas and the T-bill return on the $2,500 over the 12 weeks. The
+ * break-even cheque is the smallest deposit that covers its own costs; the minimum drop
+ * share is the share above which the fees are covered at the base deposit. The expected
+ * take is the modelled drop times the token odds, shown beside the drop so the verdict's
+ * basis is visible: the verdict is costed on the drop if it launches, at the low end of
+ * the band, and the odds-adjusted figure is never hidden.
  */
-export function farmEconomics(p: SnapshotProtocol, age: number | null, p25Usd: number, walletShare: number): FarmEconomics {
-  const hold = holdDaysFor(age);
+export function farmEconomics(
+  p: SnapshotProtocol,
+  fittedP25Usd: number,
+  tokenOdds: number,
+  deposit: number,
+  dropShare: number,
+  horizonDays: number,
+): FarmEconomics {
+  const hold = horizonDays;
   const weeks = Math.floor(hold / 7);
   const nTxn = 7 + weeks;
   const gas = gasFor(p);
   const gasTotal = nTxn * gas;
-  const capital = capitalFor(p);
-  const tbillCost = capital * FARM.tbill_annual * (hold / 365);
+  const tbillCost = deposit * FARM.tbill_annual * (hold / 365);
   const hours = (45 + 10 * weeks + 5) / 60;
-  const take = walletShare * p25Usd;
+  const take = (deposit / p.tvl_usd) * dropShare * fittedP25Usd;
+  const expectedTake = take * tokenOdds;
   const net = take - gasTotal - tbillCost;
   const perHour = net / hours;
-  const breakeven = p25Usd > 0 ? (gasTotal + tbillCost) / p25Usd : Number.POSITIVE_INFINITY;
+  const tbillRate = FARM.tbill_annual * (hold / 365);
+  const denom = (dropShare * fittedP25Usd) / p.tvl_usd - tbillRate;
+  const breakevenDeposit = denom > 0 ? gasTotal / denom : Number.POSITIVE_INFINITY;
+  const minDropShare = (deposit / p.tvl_usd) * fittedP25Usd > 0
+    ? (gasTotal + tbillCost) / ((deposit / p.tvl_usd) * fittedP25Usd)
+    : Number.POSITIVE_INFINITY;
   const verdict = net > 0 && perHour >= FARM.farm_per_hour ? 'FARM' : net > 0 ? 'MARGINAL' : 'SKIP';
   return {
     verdict,
     take_usd: Math.round(take * 100) / 100,
+    expected_take_usd: Math.round(expectedTake * 100) / 100,
     net_cash_usd: Math.round(net * 100) / 100,
     per_hour_usd: Math.round(perHour * 100) / 100,
-    breakeven_share: breakeven,
+    breakeven_deposit_usd: breakevenDeposit,
+    min_drop_share: minDropShare,
+    exit_tvl_usd: Math.round(p.tvl_usd * 0.8),
     gas_usd: Math.round(gasTotal * 100) / 100,
-    capital_usd: capital,
+    capital_usd: deposit,
     hold_days: hold,
     hours_total: Math.round(hours * 100) / 100,
     tbill_cost_usd: Math.round(tbillCost * 100) / 100,
     n_txn: nTxn,
+    deposit_usd: deposit,
+    drop_share: dropShare,
+    horizon_days: horizonDays,
   };
 }
 
@@ -1117,14 +1447,15 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     const age = ageDays(snapshot.as_of, p.listed_at);
     const predLog = predictLog(p, fit);
     const fitted = Math.exp(predLog) * fit.smearing;
+    const fittedP25 = Math.exp(predLog + model.loo_q25) * fit.smearing;
     const odds = oddsBySlug.get(p.slug)!;
     const implied = Math.max(1, Math.round(fitted * odds));
     const p25 = Math.max(1, Math.round(Math.exp(predLog + model.loo_q25) * fit.smearing * odds));
     const p75 = Math.max(1, Math.round(Math.exp(predLog + model.loo_q75) * fit.smearing * odds));
     const eff = fit.effects.get(p.category ?? '');
-    const econ = farmEconomics(p, age, p25, FARM.wallet_share);
+    const econ = farmEconomics(p, fittedP25, odds, FARM.deposit_usd, FARM.drop_share, FARM.horizon_days);
     const range = ranges.get(p.slug)!;
-    return { p, age, predLog, fitted, odds, implied, p25, p75, eff, econ, range };
+    return { p, age, predLog, fitted, fittedP25, odds, implied, p25, p75, eff, econ, range };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
 
@@ -1159,13 +1490,18 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       pred_log: s.predLog,
       p25_usd: s.p25,
       p75_usd: s.p75,
+      fitted_p25_usd: Math.round(s.fittedP25),
+      multiple: s.fitted / s.p.tvl_usd,
     },
     farm: {
       verdict: s.econ.verdict,
       take_usd: s.econ.take_usd,
+      expected_take_usd: s.econ.expected_take_usd,
       net_cash_usd: s.econ.net_cash_usd,
       per_hour_usd: s.econ.per_hour_usd,
-      breakeven_share: s.econ.breakeven_share,
+      breakeven_deposit_usd: s.econ.breakeven_deposit_usd,
+      min_drop_share: s.econ.min_drop_share,
+      exit_tvl_usd: s.econ.exit_tvl_usd,
       gas_usd: s.econ.gas_usd,
       gas_per_txn_usd: gasFor(s.p),
       n_txn: s.econ.n_txn,
@@ -1173,6 +1509,9 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       hold_days: s.econ.hold_days,
       hours_total: s.econ.hours_total,
       tbill_cost_usd: s.econ.tbill_cost_usd,
+      deposit_usd: s.econ.deposit_usd,
+      drop_share: s.econ.drop_share,
+      horizon_days: s.econ.horizon_days,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -1218,7 +1557,31 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     median_age_days: medians.medianAge,
     median_change_7d: medians.medianChange,
   };
-  const farmModel: FarmModel = { ...FARM, verdicts };
+  const beDeposits = board
+    .map((r) => r.farm.breakeven_deposit_usd)
+    .filter((d) => Number.isFinite(d))
+    .sort((a, b) => a - b);
+  const bestRow = board.reduce((best, r) => (r.farm.per_hour_usd > best.farm.per_hour_usd ? r : best), board[0]!);
+  const farmModel: FarmModel = {
+    ...FARM,
+    verdicts,
+    smallest_breakeven_deposit: beDeposits.length > 0 ? Math.round(beDeposits[0]!) : 0,
+    median_breakeven_deposit: beDeposits.length > 0 ? Math.round(median(beDeposits) ?? 0) : 0,
+    best_per_hour_usd: bestRow.farm.per_hour_usd,
+    best_per_hour_slug: bestRow.slug,
+  };
+  // The training comps, with the model's fitted value each: the scatter plot's grey dots
+  // and the nearest-peers table's source. Fitted values are in-sample, as the label says.
+  const trainRows = trainingSet(snapshot, 5).rows;
+  const comps: CompRow[] = trainRows.map((p) => ({
+    slug: p.slug,
+    name: p.name,
+    category: p.category,
+    tvl_usd: p.tvl_usd,
+    mcap_usd: p.mcap_usd!,
+    fitted_value_usd: Math.round(Math.exp(predictLog(p, fit)) * fit.smearing),
+    ratio: p.mcap_usd! / p.tvl_usd,
+  }));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -1235,6 +1598,7 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     effects,
     rows: board.map(radarRow),
     live,
+    comps,
   };
   return { board, radar };
 }
@@ -1282,9 +1646,14 @@ export function radarRow(row: BoardRow): RadarRow {
     watchlist_gap: row.watchlist_gap,
     verdict: row.farm.verdict,
     take_usd: row.farm.take_usd,
+    expected_take_usd: row.farm.expected_take_usd,
     net_cash_usd: row.farm.net_cash_usd,
     per_hour_usd: row.farm.per_hour_usd,
-    breakeven_share: row.farm.breakeven_share,
+    breakeven_deposit_usd: row.farm.breakeven_deposit_usd,
+    min_drop_share: row.farm.min_drop_share,
+    exit_tvl_usd: row.farm.exit_tvl_usd,
+    fitted_p25_usd: row.model.fitted_p25_usd,
+    multiple: row.model.multiple,
     gas_usd: row.farm.gas_usd,
     gas_per_txn_usd: row.farm.gas_per_txn_usd,
     n_txn: row.farm.n_txn,
@@ -1292,6 +1661,9 @@ export function radarRow(row: BoardRow): RadarRow {
     capital_usd: row.farm.capital_usd,
     hours_total: row.farm.hours_total,
     tbill_cost_usd: row.farm.tbill_cost_usd,
+    deposit_usd: row.farm.deposit_usd,
+    drop_share: row.farm.drop_share,
+    horizon_days: row.farm.horizon_days,
     farm_steps: row.farm_steps,
   };
 }
